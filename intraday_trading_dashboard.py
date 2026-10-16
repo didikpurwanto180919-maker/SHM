@@ -1,19 +1,20 @@
+import os
 import sys
 import subprocess
 
 # ==========================================
-# 0. AUTO-INSTALLER FALLBACK (ANTI-MODULENOTFOUND)
+# 0. AUTO-INSTALLER PUSTAKA (ANTI-MODULENOTFOUND)
 # ==========================================
-def ensure_package(package_name: str, import_name: str = None):
-    """Memastikan pustaka terinstal di server Streamlit Cloud jika requirements.txt gagal terbaca."""
-    target = import_name or package_name
+def verify_and_install(package_name: str, import_name: str = None):
+    """Memastikan pustaka eksternal terinstal di environment Streamlit Cloud."""
+    mod_name = import_name or package_name
     try:
-        __import__(target)
+        __import__(mod_name)
     except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
 
-ensure_package("yfinance")
-ensure_package("plotly")
+verify_and_install("yfinance")
+verify_and_install("plotly")
 
 import streamlit as st
 import yfinance as yf
@@ -21,499 +22,521 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime
 
 # ==========================================
-# 1. KONFIGURASI HALAMAN & KONSTANTA PASAR
+# 1. KONFIGURASI HALAMAN & INDEKS UTAMA
 # ==========================================
 st.set_page_config(
-    page_title="IDX & MSCI Financial Terminal",
+    page_title="Terminal Saham BEI (1.011 Emiten) & MSCI",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Daftar Konstituen Utama MSCI Indonesia & Saham Likuid IDX
-MSCI_INDONESIA_TICKERS = {
-    "BBCA.JK": "Bank Central Asia Tbk",
-    "BBRI.JK": "Bank Rakyat Indonesia Tbk",
-    "BMRI.JK": "Bank Mandiri Tbk",
-    "TLKM.JK": "Telkom Indonesia Tbk",
-    "ASII.JK": "Astra International Tbk",
-    "BBNI.JK": "Bank Negara Indonesia Tbk",
-    "AMMN.JK": "Amman Mineral Internasional Tbk",
-    "GOTO.JK": "GoTo Gojek Tokopedia Tbk",
-    "ADRO.JK": "Alamtri Resources Indonesia Tbk",
-    "ICBP.JK": "Indofood CBP Sukses Makmur Tbk",
-    "UNTR.JK": "United Tractors Tbk",
-    "KLBF.JK": "Kalbe Farma Tbk",
-    "INDF.JK": "Indofood Sukses Makmur Tbk",
-    "CPIN.JK": "Charoen Pokphand Indonesia Tbk"
-}
+CSV_FILENAME = "daftar_lengkap_saham_indonesia_bei.csv"
+
+MSCI_CONSTITUENTS = [
+    "BBCA", "BBRI", "BMRI", "TLKM", "ASII", "BBNI", "AMMN",
+    "GOTO", "ADRO", "ICBP", "UNTR", "KLBF", "INDF", "CPIN"
+]
 
 # ==========================================
-# 2. DATA ENGINE & CACHING LAYER
+# 2. LOADER DATABASE 1.011 SAHAM BEI & DATA PASAR
 # ==========================================
+@st.cache_data(show_spinner=False)
+def load_bei_catalog(csv_path: str) -> pd.DataFrame:
+    """Memuat seluruh daftar saham BEI dari file CSV lokal di repositori."""
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        df["Kode_Saham"] = df["Kode_Saham"].astype(str).str.strip().str.upper()
+        return df
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ohlcv_data(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    """Mengambil data historis/intraday OHLCV dengan penanganan error dan normalisasi kolom."""
+def load_market_ohlcv(ticker_symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    """Mengambil data harga historis/intraday dari Yahoo Finance."""
     try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period, interval=interval, auto_adjust=False)
-        if df is None or df.empty:
+        asset = yf.Ticker(ticker_symbol)
+        hist = asset.history(period=period, interval=interval, auto_adjust=False)
+        if hist is None or hist.empty:
             return pd.DataFrame()
-        
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-            
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-            
-        return df.dropna(subset=["Open", "High", "Low", "Close"])
-    except Exception as e:
-        st.error(f"Gagal memuat data pasar untuk {ticker}: {str(e)}")
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        hist.index = pd.to_datetime(hist.index)
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_localize(None)
+        return hist.dropna(subset=["Open", "High", "Low", "Close"])
+    except Exception as err:
+        st.error(f"Koneksi data pasar terkendala untuk {ticker_symbol}: {err}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_fundamental_data(ticker: str) -> dict:
-    """Mengambil metrik fundamental utama emiten dari Yahoo Finance API."""
+def load_fundamental_metrics(ticker_symbol: str) -> dict:
+    """Mengambil rasio keuangan dan valuasi fundamental dari Yahoo Finance."""
     try:
-        info = yf.Ticker(ticker).info
+        raw_info = yf.Ticker(ticker_symbol).info
         return {
-            "shortName": info.get("shortName", ticker),
-            "sector": info.get("sector", "N/A"),
-            "industry": info.get("industry", "N/A"),
-            "marketCap": info.get("marketCap", None),
-            "trailingPE": info.get("trailingPE", None),
-            "forwardPE": info.get("forwardPE", None),
-            "priceToBook": info.get("priceToBook", None),
-            "returnOnEquity": info.get("returnOnEquity", None),
-            "debtToEquity": info.get("debtToEquity", None),
-            "trailingEps": info.get("trailingEps", None),
-            "dividendYield": info.get("dividendYield", None),
-            "fiftyTwoWeekHigh": info.get("fiftyTwoWeekHigh", None),
-            "fiftyTwoWeekLow": info.get("fiftyTwoWeekLow", None),
+            "name": raw_info.get("shortName", ticker_symbol),
+            "sector": raw_info.get("sector", "N/A"),
+            "industry": raw_info.get("industry", "N/A"),
+            "mcap": raw_info.get("marketCap"),
+            "pe": raw_info.get("trailingPE"),
+            "pbv": raw_info.get("priceToBook"),
+            "roe": raw_info.get("returnOnEquity"),
+            "der": raw_info.get("debtToEquity"),
+            "eps": raw_info.get("trailingEps"),
+            "div_yield": raw_info.get("dividendYield"),
+            "high_52w": raw_info.get("fiftyTwoWeekHigh"),
+            "low_52w": raw_info.get("fiftyTwoWeekLow"),
         }
     except Exception:
         return {}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_multi_tickers_close(tickers: list, period: str = "6mo") -> pd.DataFrame:
-    """Mengambil harga penutupan sejumlah ticker sekaligus untuk komparasi performa relatif."""
+def load_benchmark_comparison(symbols: list, period: str = "6mo") -> pd.DataFrame:
+    """Mengunduh data penutupan multi-saham untuk perbandingan kinerja relatif."""
     try:
-        raw = yf.download(tickers, period=period, interval="1d", progress=False)
-        if raw is None or raw.empty:
+        downloaded = yf.download(symbols, period=period, interval="1d", progress=False)
+        if downloaded is None or downloaded.empty:
             return pd.DataFrame()
-        data = raw["Close"] if "Close" in raw else raw
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-        return data.dropna(how="all")
+        closes = downloaded["Close"] if "Close" in downloaded else downloaded
+        if isinstance(closes, pd.Series):
+            closes = closes.to_frame()
+        return closes.dropna(how="all")
     except Exception:
         return pd.DataFrame()
 
 # ==========================================
-# 3. QUANTITATIVE TECHNICAL & SIGNAL ENGINE
+# 3. ENGINE INDIKATOR TEKNIKAL & MANAJEMEN RISIKO
 # ==========================================
-def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Menghitung indikator teknikal lengkap: MA, Bollinger Bands, RSI, MACD, ATR, Support/Resistance."""
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Menghitung SMA, EMA, Bollinger Bands, RSI (14), MACD, dan ATR (14)."""
     if df.empty:
         return df
-    
-    data = df.copy()
-    
-    # Moving Averages (min_periods=1 mencegah NaN penuh pada dataset pendek seperti 6mo + 1wk)
-    data["SMA_20"] = data["Close"].rolling(window=20, min_periods=1).mean()
-    data["SMA_50"] = data["Close"].rolling(window=50, min_periods=1).mean()
-    data["SMA_200"] = data["Close"].rolling(window=200, min_periods=20).mean()
-    data["EMA_20"] = data["Close"].ewm(span=20, adjust=False).mean()
-    
-    # Bollinger Bands (20, 2)
-    std_20 = data["Close"].rolling(window=20, min_periods=2).std().fillna(0)
-    data["BB_Upper"] = data["SMA_20"] + (std_20 * 2)
-    data["BB_Lower"] = data["SMA_20"] - (std_20 * 2)
-    
-    # RSI (14) - Wilder's Smoothing
-    delta = data["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    data["RSI_14"] = (100 - (100 / (1 + rs))).fillna(50)
-    
-    # MACD (12, 26, 9)
-    ema_12 = data["Close"].ewm(span=12, adjust=False).mean()
-    ema_26 = data["Close"].ewm(span=26, adjust=False).mean()
-    data["MACD"] = ema_12 - ema_26
-    data["MACD_Signal"] = data["MACD"].ewm(span=9, adjust=False).mean()
-    data["MACD_Hist"] = data["MACD"] - data["MACD_Signal"]
-    
-    # Average True Range (ATR 14) untuk Volatilitas & Stop Loss Dinamis
-    high_low = data["High"] - data["Low"]
-    high_close = (data["High"] - data["Close"].shift()).abs()
-    low_close = (data["Low"] - data["Close"].shift()).abs()
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    data["ATR_14"] = true_range.rolling(window=14, min_periods=1).mean()
-    
-    # Volume Moving Average (20)
-    data["Vol_SMA_20"] = data["Volume"].rolling(window=20, min_periods=1).mean()
-    
-    return data
+
+    out = df.copy()
+    out["SMA_20"] = out["Close"].rolling(20, min_periods=1).mean()
+    out["SMA_50"] = out["Close"].rolling(50, min_periods=1).mean()
+    out["SMA_200"] = out["Close"].rolling(200, min_periods=20).mean()
+
+    rolling_std = out["Close"].rolling(20, min_periods=2).std().fillna(0)
+    out["BB_Upper"] = out["SMA_20"] + (2.0 * rolling_std)
+    out["BB_Lower"] = out["SMA_20"] - (2.0 * rolling_std)
+
+    diff = out["Close"].diff()
+    up = diff.clip(lower=0)
+    down = -1 * diff.clip(upper=0)
+    ema_up = up.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    ema_down = down.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    rs_val = ema_up / ema_down.replace(0, np.nan)
+    out["RSI_14"] = (100 - (100 / (1 + rs_val))).fillna(50)
+
+    fast_ema = out["Close"].ewm(span=12, adjust=False).mean()
+    slow_ema = out["Close"].ewm(span=26, adjust=False).mean()
+    out["MACD"] = fast_ema - slow_ema
+    out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
+    out["MACD_Hist"] = out["MACD"] - out["MACD_Signal"]
+
+    tr1 = out["High"] - out["Low"]
+    tr2 = (out["High"] - out["Close"].shift()).abs()
+    tr3 = (out["Low"] - out["Close"].shift()).abs()
+    out["ATR_14"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14, min_periods=1).mean()
+    out["Vol_MA20"] = out["Volume"].rolling(20, min_periods=1).mean()
+    return out
 
 
-def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
-    """Menghasilkan skoring objektif, rekomendasi (BUY/HOLD/SELL), dan rasio Risk/Reward."""
-    latest = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else latest
-    close = float(latest["Close"])
-    atr = float(latest.get("ATR_14", close * 0.02))
-    if pd.isna(atr) or atr <= 0:
-        atr = close * 0.02
+def evaluate_trade_setup(df: pd.DataFrame, fund: dict) -> dict:
+    """Menentukan sinyal BUY/HOLD/SELL beserta target harga dan batas Stop Loss."""
+    curr = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else curr
+    price = float(curr["Close"])
+    atr_val = float(curr.get("ATR_14", price * 0.02))
+    if pd.isna(atr_val) or atr_val <= 0:
+        atr_val = price * 0.02
 
-    score = 0
-    reasons = []
+    pts = 0
+    notes = []
 
-    # 1. Evaluasi Tren (Moving Averages)
-    if pd.notna(latest.get("SMA_20")) and pd.notna(latest.get("SMA_50")):
-        if close > latest["SMA_20"] > latest["SMA_50"]:
-            score += 2
-            reasons.append("Tren Bullish: Harga berada di atas SMA 20 dan SMA 50.")
-        elif close < latest["SMA_20"] < latest["SMA_50"]:
-            score -= 2
-            reasons.append("Tren Bearish: Harga tertekan di bawah SMA 20 dan SMA 50.")
+    if price > curr["SMA_20"] > curr["SMA_50"]:
+        pts += 2
+        notes.append("Struktur Bullish: Harga bergerak di atas SMA 20 dan SMA 50.")
+    elif price < curr["SMA_20"] < curr["SMA_50"]:
+        pts -= 2
+        notes.append("Struktur Bearish: Harga berada di bawah SMA 20 dan SMA 50.")
 
-    if pd.notna(latest.get("SMA_200")):
-        if close > latest["SMA_200"]:
-            score += 1
-            reasons.append("Tren Jangka Panjang Positif (Harga di atas SMA 200).")
+    if pd.notna(curr.get("SMA_200")):
+        if price > curr["SMA_200"]:
+            pts += 1
+            notes.append("Tren Mayor Positif: Harga di atas SMA 200.")
         else:
-            score -= 1
-            reasons.append("Harga berada di bawah rata-rata jangka panjang (SMA 200).")
+            pts -= 1
+            notes.append("Tren Mayor Tertekan: Harga di bawah SMA 200.")
 
-    # 2. Evaluasi Momentum (RSI & MACD)
-    rsi = float(latest.get("RSI_14", 50))
-    if pd.notna(rsi):
-        if 30 <= rsi <= 45:
-            score += 1
-            reasons.append(f"RSI ({rsi:.1f}) mendekati area jenuh jual (potensial rebound).")
-        elif 50 < rsi < 68:
-            score += 1
-            reasons.append(f"RSI ({rsi:.1f}) menunjukkan momentum akumulasi yang sehat.")
-        elif rsi >= 72:
-            score -= 1
-            reasons.append(f"RSI ({rsi:.1f}) berada di zona Overbought (rawan profit taking).")
-        elif rsi < 30:
-            score += 1
-            reasons.append(f"RSI ({rsi:.1f}) berada di zona Oversold ekstrem.")
+    rsi_val = float(curr.get("RSI_14", 50))
+    if 30 <= rsi_val <= 45:
+        pts += 1
+        notes.append(f"Momentum RSI ({rsi_val:.1f}) berada di area akumulasi bawah.")
+    elif 50 < rsi_val < 68:
+        pts += 1
+        notes.append(f"Momentum RSI ({rsi_val:.1f}) mengonfirmasi dorongan beli.")
+    elif rsi_val >= 72:
+        pts -= 1
+        notes.append(f"RSI ({rsi_val:.1f}) memasuki area jenuh beli (Overbought).")
 
-    if pd.notna(latest.get("MACD")) and pd.notna(latest.get("MACD_Signal")):
-        if latest["MACD"] > latest["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
-            score += 2
-            reasons.append("Sinyal Golden Cross baru terbentuk pada indikator MACD.")
-        elif latest["MACD"] > latest["MACD_Signal"]:
-            score += 1
-            reasons.append("Histogram MACD positif (momentum beli mendominasi).")
-        else:
-            score -= 1
-            reasons.append("MACD berada di bawah garis sinyal (tekanan jual aktif).")
-
-    # 3. Evaluasi Fundamental Singkat
-    pe = fund.get("trailingPE")
-    roe = fund.get("returnOnEquity")
-    if pe is not None and 0 < pe < 15:
-        score += 1
-        reasons.append(f"Valuasi PER menarik ({pe:.2f}x).")
-    if roe is not None and roe > 0.15:
-        score += 1
-        reasons.append(f"Profitabilitas ROE solid ({roe*100:.1f}%).")
-
-    if not reasons:
-        reasons.append("Pergerakan harga masih berada dalam fase konsolidasi netral.")
-
-    # Penentuan Rekomendasi
-    if score >= 3:
-        action = "BUY"
-        badge_color = "#16a34a"
-    elif score <= -2:
-        action = "SELL"
-        badge_color = "#dc2626"
+    if curr["MACD"] > curr["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
+        pts += 2
+        notes.append("Terbentuk perpotongan Golden Cross pada MACD.")
+    elif curr["MACD"] > curr["MACD_Signal"]:
+        pts += 1
+        notes.append("MACD bertahan di atas garis sinyal (momentum positif).")
     else:
-        action = "HOLD"
-        badge_color = "#d97706"
+        pts -= 1
+        notes.append("MACD masih berada di bawah garis sinyal.")
 
-    # Level Support & Resistance (20-Day Swing + ATR Buffer)
-    recent_20 = df.tail(20)
-    support_level = min(float(recent_20["Low"].min()), close - (1.8 * atr))
-    resistance_level = max(float(recent_20["High"].max()), close + (3.6 * atr))
+    pe_ratio = fund.get("pe")
+    roe_ratio = fund.get("roe")
+    if pe_ratio is not None and 0 < pe_ratio < 15:
+        pts += 1
+        notes.append(f"Valuasi PER relatif diskon ({pe_ratio:.2f}x).")
+    if roe_ratio is not None and roe_ratio > 0.15:
+        pts += 1
+        notes.append(f"Tingkat pengembalian ekuitas (ROE) tinggi ({roe_ratio*100:.1f}%).")
 
-    # Perhitungan Stop Loss & Take Profit Presisi
-    stop_loss = round(max(support_level * 0.99, close - (2.0 * atr)), 0)
-    risk = max(close - stop_loss, close * 0.01)
-    take_profit_1 = round(close + (risk * 2.0), 0)
-    take_profit_2 = round(max(resistance_level, close + (risk * 3.0)), 0)
-    rr_ratio = (take_profit_1 - close) / risk if risk > 0 else 0
+    if pts >= 3:
+        signal, color = "BUY", "#16a34a"
+    elif pts <= -2:
+        signal, color = "SELL", "#dc2626"
+    else:
+        signal, color = "HOLD", "#d97706"
+
+    window_20 = df.tail(20)
+    sup = min(float(window_20["Low"].min()), price - (1.8 * atr_val))
+    res = max(float(window_20["High"].max()), price + (3.6 * atr_val))
+
+    sl = round(max(sup * 0.99, price - (2.0 * atr_val)), 0)
+    unit_risk = max(price - sl, price * 0.01)
+    tp1 = round(price + (2.0 * unit_risk), 0)
+    tp2 = round(max(res, price + (3.0 * unit_risk)), 0)
+    rrr = (tp1 - price) / unit_risk if unit_risk > 0 else 0.0
 
     return {
-        "action": action,
-        "score": score,
-        "color": badge_color,
-        "reasons": reasons,
-        "entry": round(close, 0),
-        "support": round(support_level, 0),
-        "resistance": round(resistance_level, 0),
-        "stop_loss": stop_loss,
-        "tp1": take_profit_1,
-        "tp2": take_profit_2,
-        "risk_pct": (risk / close) * 100,
-        "reward_pct": ((take_profit_1 - close) / close) * 100,
-        "rr_ratio": rr_ratio
+        "signal": signal,
+        "score": pts,
+        "color": color,
+        "notes": notes,
+        "entry": round(price, 0),
+        "support": round(sup, 0),
+        "resistance": round(res, 0),
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "risk_pct": (unit_risk / price) * 100,
+        "reward_pct": ((tp1 - price) / price) * 100,
+        "rrr": rrr
     }
 
 # ==========================================
-# 4. VISUALISASI PLOTLY INTERAKTIF
+# 4. GRAFIK PLOTLY MULTI-PANEL
 # ==========================================
-def build_master_chart(df: pd.DataFrame, ticker: str, setup: dict) -> go.Figure:
-    """Membuat grafik interaktif 4 panel: Candlestick + BB + MA, Volume, MACD, dan RSI."""
+def render_technical_chart(df: pd.DataFrame, symbol: str, plan: dict) -> go.Figure:
+    """Membangun grafik interaktif Candlestick, Bollinger Bands, Volume, MACD, dan RSI."""
     fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         row_heights=[0.52, 0.14, 0.17, 0.17],
         subplot_titles=(
-            f"{ticker} - Price Action, Moving Averages & Bollinger Bands",
-            "Volume Transaksi & Rata-rata 20 Hari",
-            "MACD (12, 26, 9)",
-            "Relative Strength Index (RSI 14)"
+            f"{symbol} - Candlestick, Moving Averages & Bollinger Bands",
+            "Volume & MA20", "MACD (12, 26, 9)", "RSI (14)"
         )
     )
 
-    # Panel 1: Candlestick + Bollinger Bands + MA
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
         low=df["Low"], close=df["Close"], name="OHLC"
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["BB_Upper"], line=dict(color="rgba(148, 163, 184, 0.4)", width=1, dash="dot"),
+        x=df.index, y=df["BB_Upper"], line=dict(color="rgba(148,163,184,0.4)", width=1, dash="dot"),
         name="BB Upper"
     ), row=1, col=1)
-
     fig.add_trace(go.Scatter(
-        x=df.index, y=df["BB_Lower"], line=dict(color="rgba(148, 163, 184, 0.4)", width=1, dash="dot"),
-        fill="tonexty", fillcolor="rgba(148, 163, 184, 0.07)", name="BB Lower"
+        x=df.index, y=df["BB_Lower"], line=dict(color="rgba(148,163,184,0.4)", width=1, dash="dot"),
+        fill="tonexty", fillcolor="rgba(148,163,184,0.07)", name="BB Lower"
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["SMA_20"], line=dict(color="#38bdf8", width=1.5), name="SMA 20"
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["SMA_50"], line=dict(color="#f59e0b", width=1.5), name="SMA 50"
-    ), row=1, col=1)
-
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA_20"], line=dict(color="#38bdf8", width=1.5), name="SMA 20"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA_50"], line=dict(color="#f59e0b", width=1.5), name="SMA 50"), row=1, col=1)
     if df["SMA_200"].notna().sum() > 0:
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["SMA_200"], line=dict(color="#a855f7", width=1.8), name="SMA 200"
-        ), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["SMA_200"], line=dict(color="#a855f7", width=1.8), name="SMA 200"), row=1, col=1)
 
-    # Garis Horizontal Target Profit & Stop Loss
-    fig.add_hline(y=setup["tp1"], line_dash="dash", line_color="#16a34a",
-                  annotation_text=f"TP1: {setup['tp1']:,.0f}", row=1, col=1)
-    fig.add_hline(y=setup["stop_loss"], line_dash="dash", line_color="#dc2626",
-                  annotation_text=f"SL: {setup['stop_loss']:,.0f}", row=1, col=1)
+    fig.add_hline(y=plan["tp1"], line_dash="dash", line_color="#16a34a", annotation_text=f"TP1: {plan['tp1']:,.0f}", row=1, col=1)
+    fig.add_hline(y=plan["sl"], line_dash="dash", line_color="#dc2626", annotation_text=f"SL: {plan['sl']:,.0f}", row=1, col=1)
 
-    # Panel 2: Volume
-    vol_colors = ["#16a34a" if c >= o else "#dc2626" for c, o in zip(df["Close"], df["Open"])]
-    fig.add_trace(go.Bar(
-        x=df.index, y=df["Volume"], marker_color=vol_colors, name="Volume"
-    ), row=2, col=1)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["Vol_SMA_20"], line=dict(color="#facc15", width=1.2), name="Vol MA20"
-    ), row=2, col=1)
+    v_colors = ["#16a34a" if c >= o else "#dc2626" for c, o in zip(df["Close"], df["Open"])]
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=v_colors, name="Volume"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Vol_MA20"], line=dict(color="#facc15", width=1.2), name="Vol MA20"), row=2, col=1)
 
-    # Panel 3: MACD
-    hist_colors = ["#16a34a" if v >= 0 else "#dc2626" for v in df["MACD_Hist"]]
-    fig.add_trace(go.Bar(
-        x=df.index, y=df["MACD_Hist"], marker_color=hist_colors, name="MACD Hist"
-    ), row=3, col=1)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["MACD"], line=dict(color="#38bdf8", width=1.5), name="MACD"
-    ), row=3, col=1)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["MACD_Signal"], line=dict(color="#f97316", width=1.5), name="Signal"
-    ), row=3, col=1)
+    m_colors = ["#16a34a" if h >= 0 else "#dc2626" for h in df["MACD_Hist"]]
+    fig.add_trace(go.Bar(x=df.index, y=df["MACD_Hist"], marker_color=m_colors, name="Hist"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], line=dict(color="#38bdf8", width=1.5), name="MACD"), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD_Signal"], line=dict(color="#f97316", width=1.5), name="Signal"), row=3, col=1)
 
-    # Panel 4: RSI
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["RSI_14"], line=dict(color="#c084fc", width=1.8), name="RSI (14)"
-    ), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI_14"], line=dict(color="#c084fc", width=1.8), name="RSI 14"), row=4, col=1)
     fig.add_hline(y=70, line_dash="dot", line_color="#ef4444", row=4, col=1)
     fig.add_hline(y=30, line_dash="dot", line_color="#22c55e", row=4, col=1)
 
     fig.update_layout(
-        height=880,
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
+        height=860, template="plotly_dark", xaxis_rangeslider_visible=False,
         margin=dict(l=20, r=20, t=40, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1)
     )
     return fig
 
 # ==========================================
-# 5. LAYOUT UTAMA & SIDEBAR NAVIGATION
+# 5. SIDEBAR FILTER & PEMILIHAN DARI 1.011 SAHAM BEI
 # ==========================================
+bei_df = load_bei_catalog(CSV_FILENAME)
+
 with st.sidebar:
-    st.title("🏛️ IDX & MSCI Terminal")
-    st.caption("Real-Time Fundamental, Technical & Risk Engine")
+    st.title("🏛️ Terminal Saham BEI")
+    st.caption("Terintegrasi Database 1.011 Emiten IDX & MSCI")
+
+    if bei_df.empty:
+        st.warning(f"File `{CSV_FILENAME}` belum ditemukan di folder GitHub.")
+        uploaded_csv = st.file_uploader("Unggah file CSV Saham BEI:", type=["csv"])
+        if uploaded_csv is not None:
+            bei_df = pd.read_csv(uploaded_csv)
+            bei_df["Kode_Saham"] = bei_df["Kode_Saham"].astype(str).str.strip().str.upper()
+
     st.divider()
 
-    category = st.radio(
-        "Pilih Kategori Aset:",
-        ["Konstituen MSCI Indonesia", "Indeks Utama (IHSG)", "Input Ticker Kustom (IDX)"]
-    )
-
-    if category == "Konstituen MSCI Indonesia":
-        selected_ticker = st.selectbox(
-            "Pilih Saham MSCI:",
-            options=list(MSCI_INDONESIA_TICKERS.keys()),
-            format_func=lambda x: f"{x.replace('.JK', '')} - {MSCI_INDONESIA_TICKERS[x]}"
+    if not bei_df.empty:
+        universe_mode = st.selectbox(
+            "Filter Kategori / Indeks:",
+            [
+                "Semua Emiten Aktif BEI",
+                "Seluruh Database BEI (1.011 Saham)",
+                "Konstituen MSCI Indonesia",
+                "Indeks LQ45",
+                "Indeks KOMPAS100",
+                "Indeks PEFINDO25",
+                "Indeks Acuan IHSG (^JKSE)"
+            ]
         )
-    elif category == "Indeks Utama (IHSG)":
-        selected_ticker = "^JKSE"
+
+        filtered_df = bei_df.copy()
+        if universe_mode == "Semua Emiten Aktif BEI":
+            filtered_df = filtered_df[filtered_df["Status_Pencatatan"] != "Delisting"]
+        elif universe_mode == "Konstituen MSCI Indonesia":
+            filtered_df = filtered_df[filtered_df["Kode_Saham"].isin(MSCI_CONSTITUENTS)]
+        elif universe_mode == "Indeks LQ45":
+            filtered_df = filtered_df[filtered_df["Indeks_Utama"].str.contains("LQ45", na=False)]
+        elif universe_mode == "Indeks KOMPAS100":
+            filtered_df = filtered_df[filtered_df["Indeks_Utama"].str.contains("KOMPAS100", na=False)]
+        elif universe_mode == "Indeks PEFINDO25":
+            filtered_df = filtered_df[filtered_df["Indeks_Utama"].str.contains("PEFINDO25", na=False)]
+
+        if universe_mode != "Indeks Acuan IHSG (^JKSE)":
+            sector_list = ["Semua Sektor"] + sorted(filtered_df["Sektor_Indonesia"].dropna().unique().tolist())
+            chosen_sector = st.selectbox("Filter Sektor BEI:", sector_list)
+            if chosen_sector != "Semua Sektor":
+                filtered_df = filtered_df[filtered_df["Sektor_Indonesia"] == chosen_sector]
+
+            board_list = ["Semua Papan"] + sorted(filtered_df["Papan_Pencatatan"].dropna().unique().tolist())
+            chosen_board = st.selectbox("Filter Papan Pencatatan:", board_list)
+            if chosen_board != "Semua Papan":
+                filtered_df = filtered_df[filtered_df["Papan_Pencatatan"] == chosen_board]
+
+            st.caption(f"Menampilkan **{len(filtered_df)}** emiten sesuai filter.")
+
+            if not filtered_df.empty:
+                options_map = {
+                    row["Ticker_Yahoo_Finance"]: f"{row['Kode_Saham']} - {row['Nama_Perusahaan']} ({row['Papan_Pencatatan']})"
+                    for _, row in filtered_df.iterrows()
+                }
+                selected_symbol = st.selectbox(
+                    "Pilih Emiten BEI:",
+                    options=list(options_map.keys()),
+                    format_func=lambda x: options_map.get(x, x)
+                )
+            else:
+                st.warning("Tidak ada emiten yang cocok dengan kombinasi filter.")
+                st.stop()
+        else:
+            selected_symbol = "^JKSE"
     else:
-        raw_input = st.text_input("Masukkan Kode Saham IDX (contoh: BREN, PTBA, MDKA):", value="BMRI").upper().strip()
-        selected_ticker = raw_input if raw_input.endswith(".JK") or raw_input.startswith("^") else f"{raw_input}.JK"
+        fallback_code = st.text_input("Masukkan Kode Saham BEI (contoh: BBCA, BMRI, AADI):", value="BBCA").upper().strip()
+        selected_symbol = fallback_code if fallback_code.endswith(".JK") or fallback_code.startswith("^") else f"{fallback_code}.JK"
 
-    period_opt = st.selectbox("Rentang Waktu Historis:", ["6mo", "1y", "2y", "5y"], index=1)
-    interval_opt = st.selectbox("Interval Data:", ["1d", "1wk", "1h"], index=0)
+    period_choice = st.selectbox("Rentang Historis:", ["6mo", "1y", "2y", "5y"], index=1)
+    interval_choice = st.selectbox("Interval Candle:", ["1d", "1wk", "1h"], index=0)
 
-    if st.button("🔄 Refresh Data Real-Time", use_container_width=True):
+    if st.button("🔄 Muat Ulang Data Real-Time", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-# Header Indeks Acuan IHSG & Saham Terpilih
-ihsg_df = fetch_ohlcv_data("^JKSE", period="5d", interval="1d")
-raw_df = fetch_ohlcv_data(selected_ticker, period=period_opt, interval=interval_opt)
+# ==========================================
+# 6. EKSEKUSI DATA & METRIK HEADER
+# ==========================================
+ihsg_data = load_market_ohlcv("^JKSE", period="5d", interval="1d")
+price_df = load_market_ohlcv(selected_symbol, period=period_choice, interval=interval_choice)
 
-if raw_df.empty:
-    st.warning(f"Data tidak ditemukan untuk ticker **{selected_ticker}**. Pastikan kode emiten terdaftar di Yahoo Finance (akhiran `.JK`).")
+if price_df.empty:
+    st.error(
+        f"Data transaksi Yahoo Finance untuk **{selected_symbol}** tidak tersedia "
+        "(emiten mungkin berstatus Delisting, Suspensi, atau belum memiliki riwayat perdagangan)."
+    )
     st.stop()
 
-df_tech = calculate_technical_indicators(raw_df)
-fund_data = fetch_fundamental_data(selected_ticker) if selected_ticker != "^JKSE" else {}
-trade_setup = generate_trading_decision(df_tech, fund_data)
+tech_df = compute_indicators(price_df)
+fund_info = load_fundamental_metrics(selected_symbol) if selected_symbol != "^JKSE" else {}
+setup_plan = evaluate_trade_setup(tech_df, fund_info)
 
-# Baris Metrik Utama
-last_close = float(df_tech["Close"].iloc[-1])
-prev_close = float(df_tech["Close"].iloc[-2]) if len(df_tech) > 1 else last_close
-pct_change = ((last_close - prev_close) / prev_close) * 100 if prev_close != 0 else 0.0
+# Ambil metadata dari CSV untuk saham terpilih
+csv_profile = {}
+if not bei_df.empty and selected_symbol != "^JKSE":
+    match_row = bei_df[bei_df["Ticker_Yahoo_Finance"] == selected_symbol]
+    if not match_row.empty:
+        csv_profile = match_row.iloc[0].to_dict()
 
-col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+last_px = float(tech_df["Close"].iloc[-1])
+prev_px = float(tech_df["Close"].iloc[-2]) if len(tech_df) > 1 else last_px
+chg_pct = ((last_px - prev_px) / prev_px) * 100 if prev_px != 0 else 0.0
 
-if not ihsg_df.empty and len(ihsg_df) >= 2:
-    ihsg_last = float(ihsg_df["Close"].iloc[-1])
-    ihsg_prev = float(ihsg_df["Close"].iloc[-2])
-    ihsg_chg = ((ihsg_last - ihsg_prev) / ihsg_prev) * 100
-    col_m1.metric("IHSG (^JKSE)", f"{ihsg_last:,.2f}", f"{ihsg_chg:+.2f}%")
+m1, m2, m3, m4, m5 = st.columns(5)
+if not ihsg_data.empty and len(ihsg_data) >= 2:
+    jkse_now = float(ihsg_data["Close"].iloc[-1])
+    jkse_prev = float(ihsg_data["Close"].iloc[-2])
+    jkse_pct = ((jkse_now - jkse_prev) / jkse_prev) * 100
+    m1.metric("IHSG (^JKSE)", f"{jkse_now:,.2f}", f"{jkse_pct:+.2f}%")
 else:
-    col_m1.metric("IHSG (^JKSE)", "N/A", "0.00%")
+    m1.metric("IHSG (^JKSE)", "N/A", "0.00%")
 
-col_m2.metric(f"Harga {selected_ticker.replace('.JK', '')}", f"Rp {last_close:,.0f}", f"{pct_change:+.2f}%")
-col_m3.metric("Rekomendasi Sistem", trade_setup["action"], f"Skor Kuantitatif: {trade_setup['score']}")
-col_m4.metric("RSI (14) Momentum", f"{df_tech['RSI_14'].iloc[-1]:.1f}", "Netral (30-70)")
-col_m5.metric("Risk / Reward Ratio", f"1 : {trade_setup['rr_ratio']:.2f}", f"SL -{trade_setup['risk_pct']:.1f}% | TP1 +{trade_setup['reward_pct']:.1f}%")
+m2.metric(f"Harga {selected_symbol.replace('.JK', '')}", f"Rp {last_px:,.0f}", f"{chg_pct:+.2f}%")
+m3.metric("Sinyal Kuantitatif", setup_plan["signal"], f"Skor: {setup_plan['score']}")
+m4.metric("Momentum RSI (14)", f"{tech_df['RSI_14'].iloc[-1]:.1f}", csv_profile.get("Papan_Pencatatan", "IDX"))
+m5.metric("Risk / Reward Ratio", f"1 : {setup_plan['rrr']:.2f}", f"SL -{setup_plan['risk_pct']:.1f}% | TP1 +{setup_plan['reward_pct']:.1f}%")
 
 st.divider()
 
 # ==========================================
-# 6. TABS ANALISIS MENDALAM
+# 7. TABS VISUALISASI & DIREKTORI 1.011 EMITEN
 # ==========================================
-tab_chart, tab_fund, tab_msci = st.tabs([
-    "📊 Analisis Teknikal & Trade Setup",
-    "📑 Valuasi Fundamental & Rasio Keuangan",
-    "🌐 Komparasi Kinerja Konstituen MSCI vs IHSG"
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Analisis Teknikal & Sinyal Trading",
+    "📑 Fundamental & Profil Pencatatan BEI",
+    "🌐 Komparasi Kinerja MSCI & Big Caps",
+    "🗂️ Direktori Lengkap 1.011 Saham BEI"
 ])
 
-with tab_chart:
-    c_left, c_right = st.columns([2.6, 1])
-    with c_left:
-        st.plotly_chart(build_master_chart(df_tech, selected_ticker, trade_setup), use_container_width=True)
-    with c_right:
-        st.subheader("🎯 Eksekusi & Manajemen Risiko")
+with tab1:
+    col_chart, col_plan = st.columns([2.6, 1])
+    with col_chart:
+        st.plotly_chart(render_technical_chart(tech_df, selected_symbol, setup_plan), use_container_width=True)
+    with col_plan:
+        st.subheader("🎯 Rencana Eksekusi")
         st.markdown(
-            f"<div style='background-color:{trade_setup['color']};padding:12px;border-radius:8px;text-align:center;color:white;font-weight:bold;font-size:20px;'>"
-            f"REKOMENDASI: {trade_setup['action']}</div>",
+            f"<div style='background-color:{setup_plan['color']};padding:12px;border-radius:8px;text-align:center;color:white;font-weight:bold;font-size:20px;'>"
+            f"REKOMENDASI: {setup_plan['signal']}</div>",
             unsafe_allow_html=True
         )
-        st.write("")
+        if csv_profile:
+            st.caption(
+                f"**{csv_profile.get('Nama_Perusahaan')}** | Sektor: {csv_profile.get('Sektor_Indonesia')} | "
+                f"Indeks: {csv_profile.get('Indeks_Utama')}"
+            )
         st.markdown(f"""
-        * **Harga Acuan / Entry:** `Rp {trade_setup['entry']:,.0f}`
-        * **Target Profit 1 (Konservatif):** `Rp {trade_setup['tp1']:,.0f}` (+{trade_setup['reward_pct']:.2f}%)
-        * **Target Profit 2 (Agresif):** `Rp {trade_setup['tp2']:,.0f}`
-        * **Stop Loss (Batas Risiko):** `Rp {trade_setup['stop_loss']:,.0f}` (-{trade_setup['risk_pct']:.2f}%)
-        * **Support Terdekat (20D):** `Rp {trade_setup['support']:,.0f}`
-        * **Resistance Terdekat (20D):** `Rp {trade_setup['resistance']:,.0f}`
+        * **Harga Entry Acuan:** `Rp {setup_plan['entry']:,.0f}`
+        * **Target Profit 1 (TP1):** `Rp {setup_plan['tp1']:,.0f}` (+{setup_plan['reward_pct']:.2f}%)
+        * **Target Profit 2 (TP2):** `Rp {setup_plan['tp2']:,.0f}`
+        * **Batas Stop Loss (SL):** `Rp {setup_plan['sl']:,.0f}` (-{setup_plan['risk_pct']:.2f}%)
+        * **Support 20 Hari:** `Rp {setup_plan['support']:,.0f}`
+        * **Resistance 20 Hari:** `Rp {setup_plan['resistance']:,.0f}`
         """)
         st.divider()
-        st.subheader("🔍 Dasar Pertimbangan Algoritma")
-        for r in trade_setup["reasons"]:
-            st.markdown(f"- {r}")
+        st.subheader("🔍 Indikator Pendukung")
+        for note in setup_plan["notes"]:
+            st.markdown(f"- {note}")
 
-with tab_fund:
-    if selected_ticker == "^JKSE":
-        st.info("Data rasio laporan keuangan emiten tidak berlaku untuk indeks agregat IHSG (`^JKSE`). Pilih saham konstituen IDX/MSCI pada sidebar.")
+with tab2:
+    if selected_symbol == "^JKSE":
+        st.info("Pilih salah satu dari 1.011 emiten BEI pada sidebar untuk melihat profil pencatatan dan rasio fundamental.")
     else:
-        st.subheader(f"Ringkasan Fundamental: {fund_data.get('shortName', selected_ticker)}")
-        st.caption(f"Sektor: **{fund_data.get('sector', 'N/A')}** | Industri: **{fund_data.get('industry', 'N/A')}**")
-        
-        f1, f2, f3, f4 = st.columns(4)
-        mcap = fund_data.get("marketCap")
-        pe = fund_data.get("trailingPE")
-        pbv = fund_data.get("priceToBook")
-        roe = fund_data.get("returnOnEquity")
-        der = fund_data.get("debtToEquity")
-        eps = fund_data.get("trailingEps")
-        div = fund_data.get("dividendYield")
-        high52 = fund_data.get("fiftyTwoWeekHigh")
+        if csv_profile:
+            st.subheader(f"🏛️ Profil Resmi BEI: {csv_profile.get('Nama_Perusahaan')} ({csv_profile.get('Kode_Saham')})")
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Sektor BEI (IDX-IC)", csv_profile.get("Sektor_Indonesia", "-"))
+            p2.metric("Papan Pencatatan", csv_profile.get("Papan_Pencatatan", "-"))
+            p3.metric("Tanggal IPO", csv_profile.get("Tanggal_IPO_Teks", "-"))
+            p4.metric("Jumlah Saham Tercatat", f"{int(csv_profile.get('Jumlah_Saham_Tercatat', 0)):,}")
 
-        f1.metric("Market Cap", f"Rp {mcap/1e12:,.2f} T" if mcap else "N/A")
-        f2.metric("PER (Trailing)", f"{pe:.2f}x" if pe else "N/A")
-        f3.metric("PBV (Price to Book)", f"{pbv:.2f}x" if pbv else "N/A")
-        f4.metric("ROE (Return on Equity)", f"{roe*100:.2f}%" if roe else "N/A")
+            st.caption(
+                f"**Kode Lintas Platform:** BEI: `{csv_profile.get('Ticker_BEI')}` | "
+                f"TradingView: `{csv_profile.get('Ticker_TradingView')}` | "
+                f"Yahoo: `{csv_profile.get('Ticker_Yahoo_Finance')}` | "
+                f"Bloomberg: `{csv_profile.get('Ticker_Bloomberg')}` | "
+                f"Indeks Utama: `{csv_profile.get('Indeks_Utama')}`"
+            )
+            st.divider()
 
-        f5, f6, f7, f8 = st.columns(4)
-        f5.metric("EPS (Trailing)", f"Rp {eps:,.0f}" if eps else "N/A")
-        f6.metric("Debt to Equity (DER)", f"{der:.2f}%" if der else "N/A")
-        f7.metric("Dividend Yield", f"{div*100:.2f}%" if div else "N/A")
-        f8.metric("52-Week High", f"Rp {high52:,.0f}" if high52 else "N/A")
+        st.subheader("📑 Rasio Valuasi & Profitabilitas (Yahoo Finance)")
+        k1, k2, k3, k4 = st.columns(4)
+        mcap = fund_info.get("mcap")
+        pe = fund_info.get("pe")
+        pbv = fund_info.get("pbv")
+        roe = fund_info.get("roe")
+        der = fund_info.get("der")
+        eps = fund_info.get("eps")
+        div_y = fund_info.get("div_yield")
+        h52 = fund_info.get("high_52w")
 
-with tab_msci:
-    st.subheader("Perbandingan Performa Relatif: IHSG vs Big Caps MSCI Indonesia (Normalized %)")
-    compare_list = ["^JKSE", "BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK", "ASII.JK", "AMMN.JK"]
-    multi_close = fetch_multi_tickers_close(compare_list, period="6mo")
+        k1.metric("Kapitalisasi Pasar", f"Rp {mcap/1e12:,.2f} T" if mcap else "N/A")
+        k2.metric("PER (Trailing)", f"{pe:.2f}x" if pe else "N/A")
+        k3.metric("PBV (Price to Book)", f"{pbv:.2f}x" if pbv else "N/A")
+        k4.metric("ROE (Return on Equity)", f"{roe*100:.2f}%" if roe else "N/A")
 
-    if not multi_close.empty:
-        normalized_df = (multi_close / multi_close.ffill().bfill().iloc[0] - 1) * 100
-        fig_comp = go.Figure()
-        for col in normalized_df.columns:
-            line_width = 3 if col == "^JKSE" else 1.6
-            fig_comp.add_trace(go.Scatter(
-                x=normalized_df.index,
-                y=normalized_df[col],
-                mode="lines",
-                name=str(col).replace(".JK", ""),
-                line=dict(width=line_width)
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("EPS (Laba per Saham)", f"Rp {eps:,.0f}" if eps else "N/A")
+        k6.metric("DER (Debt to Equity)", f"{der:.2f}%" if der else "N/A")
+        k7.metric("Dividend Yield", f"{div_y*100:.2f}%" if div_y else "N/A")
+        k8.metric("Tertinggi 52 Minggu", f"Rp {h52:,.0f}" if h52 else "N/A")
+
+with tab3:
+    st.subheader("Perbandingan Return Relatif (6 Bulan): IHSG vs Konstituen Utama")
+    bench_tickers = ["^JKSE", "BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK", "ASII.JK", "AMMN.JK"]
+    if selected_symbol not in bench_tickers:
+        bench_tickers.append(selected_symbol)
+
+    comp_df = load_benchmark_comparison(bench_tickers, period="6mo")
+    if not comp_df.empty:
+        norm_df = (comp_df / comp_df.ffill().bfill().iloc[0] - 1) * 100
+        fig_rel = go.Figure()
+        for col in norm_df.columns:
+            width_val = 3.0 if col in ["^JKSE", selected_symbol] else 1.5
+            fig_rel.add_trace(go.Scatter(
+                x=norm_df.index, y=norm_df[col], mode="lines",
+                name=str(col).replace(".JK", ""), line=dict(width=width_val)
             ))
-        fig_comp.update_layout(
-            height=500,
-            template="plotly_dark",
-            yaxis_title="Return Relatif (%)",
-            xaxis_title="Tanggal",
-            hovermode="x unified"
+        fig_rel.update_layout(
+            height=500, template="plotly_dark",
+            yaxis_title="Return Kumulatif (%)", xaxis_title="Tanggal", hovermode="x unified"
         )
-        st.plotly_chart(fig_comp, use_container_width=True)
+        st.plotly_chart(fig_rel, use_container_width=True)
+
+with tab4:
+    st.subheader("🗂️ Database Lengkap 1.011 Emiten Bursa Efek Indonesia")
+    if not bei_df.empty:
+        search_q = st.text_input("🔍 Cari Kode Saham atau Nama Perusahaan:", "")
+        view_df = bei_df.copy()
+        if search_q:
+            mask = (
+                view_df["Kode_Saham"].str.contains(search_q, case=False, na=False) |
+                view_df["Nama_Perusahaan"].str.contains(search_q, case=False, na=False) |
+                view_df["Sektor_Indonesia"].str.contains(search_q, case=False, na=False)
+            )
+            view_df = view_df[mask]
+        st.dataframe(view_df, use_container_width=True, height=520)
     else:
-        st.warning("Gagal memuat data komparasi multi-indeks.")
+        st.info(f"Unggah file `{CSV_FILENAME}` ke repositori GitHub Anda untuk menampilkan tabel 1.011 emiten.")
