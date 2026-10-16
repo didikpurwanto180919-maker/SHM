@@ -1,3 +1,20 @@
+import sys
+import subprocess
+
+# ==========================================
+# 0. AUTO-INSTALLER FALLBACK (ANTI-MODULENOTFOUND)
+# ==========================================
+def ensure_package(package_name: str, import_name: str = None):
+    """Memastikan pustaka terinstal di server Streamlit Cloud jika requirements.txt gagal terbaca."""
+    target = import_name or package_name
+    try:
+        __import__(target)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+
+ensure_package("yfinance")
+ensure_package("plotly")
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -46,7 +63,6 @@ def fetch_ohlcv_data(ticker: str, period: str = "1y", interval: str = "1d") -> p
         if df is None or df.empty:
             return pd.DataFrame()
         
-        # Normalisasi jika terdapat MultiIndex pada kolom
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
             
@@ -88,7 +104,10 @@ def fetch_fundamental_data(ticker: str) -> dict:
 def fetch_multi_tickers_close(tickers: list, period: str = "6mo") -> pd.DataFrame:
     """Mengambil harga penutupan sejumlah ticker sekaligus untuk komparasi performa relatif."""
     try:
-        data = yf.download(tickers, period=period, interval="1d", progress=False)["Close"]
+        raw = yf.download(tickers, period=period, interval="1d", progress=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        data = raw["Close"] if "Close" in raw else raw
         if isinstance(data, pd.Series):
             data = data.to_frame()
         return data.dropna(how="all")
@@ -100,19 +119,19 @@ def fetch_multi_tickers_close(tickers: list, period: str = "6mo") -> pd.DataFram
 # ==========================================
 def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Menghitung indikator teknikal lengkap: MA, Bollinger Bands, RSI, MACD, ATR, Support/Resistance."""
-    if df.empty or len(df) < 30:
+    if df.empty:
         return df
     
     data = df.copy()
     
-    # Moving Averages
-    data["SMA_20"] = data["Close"].rolling(window=20).mean()
-    data["SMA_50"] = data["Close"].rolling(window=50).mean()
-    data["SMA_200"] = data["Close"].rolling(window=200).mean()
+    # Moving Averages (min_periods=1 mencegah NaN penuh pada dataset pendek seperti 6mo + 1wk)
+    data["SMA_20"] = data["Close"].rolling(window=20, min_periods=1).mean()
+    data["SMA_50"] = data["Close"].rolling(window=50, min_periods=1).mean()
+    data["SMA_200"] = data["Close"].rolling(window=200, min_periods=20).mean()
     data["EMA_20"] = data["Close"].ewm(span=20, adjust=False).mean()
     
     # Bollinger Bands (20, 2)
-    std_20 = data["Close"].rolling(window=20).std()
+    std_20 = data["Close"].rolling(window=20, min_periods=2).std().fillna(0)
     data["BB_Upper"] = data["SMA_20"] + (std_20 * 2)
     data["BB_Lower"] = data["SMA_20"] - (std_20 * 2)
     
@@ -120,10 +139,10 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     delta = data["Close"].diff()
     gain = delta.clip(lower=0)
     loss = -1 * delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=1, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    data["RSI_14"] = 100 - (100 / (1 + rs))
+    data["RSI_14"] = (100 - (100 / (1 + rs))).fillna(50)
     
     # MACD (12, 26, 9)
     ema_12 = data["Close"].ewm(span=12, adjust=False).mean()
@@ -137,10 +156,10 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high_close = (data["High"] - data["Close"].shift()).abs()
     low_close = (data["Low"] - data["Close"].shift()).abs()
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    data["ATR_14"] = true_range.rolling(window=14).mean()
+    data["ATR_14"] = true_range.rolling(window=14, min_periods=1).mean()
     
     # Volume Moving Average (20)
-    data["Vol_SMA_20"] = data["Volume"].rolling(window=20).mean()
+    data["Vol_SMA_20"] = data["Volume"].rolling(window=20, min_periods=1).mean()
     
     return data
 
@@ -149,16 +168,16 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
     """Menghasilkan skoring objektif, rekomendasi (BUY/HOLD/SELL), dan rasio Risk/Reward."""
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) > 1 else latest
-    close = latest["Close"]
-    atr = latest.get("ATR_14", close * 0.02)
-    if pd.isna(atr) or atr == 0:
+    close = float(latest["Close"])
+    atr = float(latest.get("ATR_14", close * 0.02))
+    if pd.isna(atr) or atr <= 0:
         atr = close * 0.02
 
     score = 0
     reasons = []
 
     # 1. Evaluasi Tren (Moving Averages)
-    if pd.notna(latest["SMA_20"]) and pd.notna(latest["SMA_50"]):
+    if pd.notna(latest.get("SMA_20")) and pd.notna(latest.get("SMA_50")):
         if close > latest["SMA_20"] > latest["SMA_50"]:
             score += 2
             reasons.append("Tren Bullish: Harga berada di atas SMA 20 dan SMA 50.")
@@ -166,7 +185,7 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
             score -= 2
             reasons.append("Tren Bearish: Harga tertekan di bawah SMA 20 dan SMA 50.")
 
-    if pd.notna(latest["SMA_200"]):
+    if pd.notna(latest.get("SMA_200")):
         if close > latest["SMA_200"]:
             score += 1
             reasons.append("Tren Jangka Panjang Positif (Harga di atas SMA 200).")
@@ -175,7 +194,7 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
             reasons.append("Harga berada di bawah rata-rata jangka panjang (SMA 200).")
 
     # 2. Evaluasi Momentum (RSI & MACD)
-    rsi = latest.get("RSI_14", 50)
+    rsi = float(latest.get("RSI_14", 50))
     if pd.notna(rsi):
         if 30 <= rsi <= 45:
             score += 1
@@ -190,7 +209,7 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
             score += 1
             reasons.append(f"RSI ({rsi:.1f}) berada di zona Oversold ekstrem.")
 
-    if pd.notna(latest["MACD"]) and pd.notna(latest["MACD_Signal"]):
+    if pd.notna(latest.get("MACD")) and pd.notna(latest.get("MACD_Signal")):
         if latest["MACD"] > latest["MACD_Signal"] and prev["MACD"] <= prev["MACD_Signal"]:
             score += 2
             reasons.append("Sinyal Golden Cross baru terbentuk pada indikator MACD.")
@@ -211,6 +230,9 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
         score += 1
         reasons.append(f"Profitabilitas ROE solid ({roe*100:.1f}%).")
 
+    if not reasons:
+        reasons.append("Pergerakan harga masih berada dalam fase konsolidasi netral.")
+
     # Penentuan Rekomendasi
     if score >= 3:
         action = "BUY"
@@ -224,8 +246,8 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
 
     # Level Support & Resistance (20-Day Swing + ATR Buffer)
     recent_20 = df.tail(20)
-    support_level = min(recent_20["Low"].min(), close - (1.8 * atr))
-    resistance_level = max(recent_20["High"].max(), close + (3.6 * atr))
+    support_level = min(float(recent_20["Low"].min()), close - (1.8 * atr))
+    resistance_level = max(float(recent_20["High"].max()), close + (3.6 * atr))
 
     # Perhitungan Stop Loss & Take Profit Presisi
     stop_loss = round(max(support_level * 0.99, close - (2.0 * atr)), 0)
@@ -254,7 +276,7 @@ def generate_trading_decision(df: pd.DataFrame, fund: dict) -> dict:
 # 4. VISUALISASI PLOTLY INTERAKTIF
 # ==========================================
 def build_master_chart(df: pd.DataFrame, ticker: str, setup: dict) -> go.Figure:
-    """Membuat grafik interaktif 3 panel: Candlestick + BB + MA, Volume, dan RSI/MACD."""
+    """Membuat grafik interaktif 4 panel: Candlestick + BB + MA, Volume, MACD, dan RSI."""
     fig = make_subplots(
         rows=4, cols=1,
         shared_xaxes=True,
@@ -385,15 +407,15 @@ fund_data = fetch_fundamental_data(selected_ticker) if selected_ticker != "^JKSE
 trade_setup = generate_trading_decision(df_tech, fund_data)
 
 # Baris Metrik Utama
-last_close = df_tech["Close"].iloc[-1]
-prev_close = df_tech["Close"].iloc[-2] if len(df_tech) > 1 else last_close
-pct_change = ((last_close - prev_close) / prev_close) * 100
+last_close = float(df_tech["Close"].iloc[-1])
+prev_close = float(df_tech["Close"].iloc[-2]) if len(df_tech) > 1 else last_close
+pct_change = ((last_close - prev_close) / prev_close) * 100 if prev_close != 0 else 0.0
 
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 
 if not ihsg_df.empty and len(ihsg_df) >= 2:
-    ihsg_last = ihsg_df["Close"].iloc[-1]
-    ihsg_prev = ihsg_df["Close"].iloc[-2]
+    ihsg_last = float(ihsg_df["Close"].iloc[-1])
+    ihsg_prev = float(ihsg_df["Close"].iloc[-2])
     ihsg_chg = ((ihsg_last - ihsg_prev) / ihsg_prev) * 100
     col_m1.metric("IHSG (^JKSE)", f"{ihsg_last:,.2f}", f"{ihsg_chg:+.2f}%")
 else:
@@ -482,7 +504,7 @@ with tab_msci:
                 x=normalized_df.index,
                 y=normalized_df[col],
                 mode="lines",
-                name=col.replace(".JK", ""),
+                name=str(col).replace(".JK", ""),
                 line=dict(width=line_width)
             ))
         fig_comp.update_layout(
